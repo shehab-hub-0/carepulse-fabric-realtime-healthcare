@@ -1,0 +1,9 @@
+.env
+output/
+output_stream/
+__pycache__/
+.pytest_cache/
+java_bridge/classes/
+*.log
+synthea-with-dependencies.jar
+jars/synthea-with-dependencies.jar

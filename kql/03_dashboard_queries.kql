@@ -1,0 +1,236 @@
+// =============================================================================
+// CarePulse - Microsoft Fabric Real-Time Dashboard Queries
+// Prerequisite: Run kql/02_gold_cleaning.kql in CarePulse_EH first.
+// All time-filtered tiles use Fabric's built-in _startTime and _endTime.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// PAGE 1: LIVE OPERATIONS  (Recommended page name: "Live Operations")
+// Recommended Grid:
+//   Row 1 (Banner): 5-6 Stat Cards across top (or 1 wide Multi Stat tile)
+//   Row 2 (Hero):   Left = Hospital Network Geo Map | Right = Live Stream Throughput
+//   Row 3 (Detail): Left = Top 10 Hospitals | Middle = Revenue by State | Right = Visit Class
+// -----------------------------------------------------------------------------
+
+// [Tile 1A] Visual: Stat Cards (Recommended — create 5-6 small Stat tiles across Row 1)
+// Card 1 — Title: "Total Encounters" | Unit: none
+clean_encounters() | where event_time between (_startTime .. _endTime) | summarize TotalEncounters = count()
+
+// Card 2 — Title: "ER Visits" | Unit: none
+clean_encounters() | where event_time between (_startTime .. _endTime) | summarize ER_Visits = countif(encounterclass == "emergency")
+
+// Card 3 — Title: "Active Patients" | Unit: none
+clean_patients() | where event_time between (_startTime .. _endTime) | summarize ActivePatients = count()
+
+// Card 4 — Title: "Active Hospitals" | Unit: none
+clean_encounters() | where event_time between (_startTime .. _endTime) | summarize ActiveHospitals = dcount(organization)
+
+// Card 5 — Title: "Total Billed Revenue" | Unit: USD ($)
+clean_encounters() | where event_time between (_startTime .. _endTime) | summarize TotalBilledUSD = round(sum(total_claim_cost), 0)
+
+// Card 6 — Title: "Avg Ingestion Lag" | Unit: Seconds (s)
+synthea_raw | where ingestion_time() between (_startTime .. _endTime) | summarize AvgLagSec = round(avg(datetime_diff('second', ingestion_time(), todatetime(payload["event_time"]))), 1)
+
+// [Tile 1B] Visual: Table — Title: "Live ER & Inpatient Feed" (Recommended for Bottom-Middle slot on Page 1)
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| where is_acute == true
+| join kind=leftouter (clean_patients() | project pat_id = id, Patient = full_name) on $left.patient == $right.pat_id
+| join kind=leftouter (organizations | summarize arg_max(event_time, *) by id | project org_id = id, Hospital = ["name"]) on $left.organization == $right.org_id
+| project
+    Time = event_time,
+    Patient = coalesce(Patient, patient),
+    Hospital,
+    State = sim_state,
+    Class = encounterclass,
+    Reason = reason,
+    Min = duration_minutes,
+    CostUSD = round(total_claim_cost, 2)
+| order by Time desc
+| take 25
+
+// [Tile 1C] Alternative for Bottom-Middle — Visual: Bar chart — Title: "Top 10 Clinical Visit Reasons"
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| summarize Visits = count() by Reason = reason
+| top 10 by Visits desc
+
+// [Tile 2] Visual: Timechart — Title: "Live Stream Throughput (Events / min)"
+union withsource=SourceTable
+    patients, organizations, providers, payers, payer_transitions,
+    encounters, conditions, allergies, careplans, medications, procedures, immunizations,
+    observations, imaging_studies, devices, supplies,
+    claims, claims_transactions, patient_expenses
+| where event_time between (_startTime .. _endTime)
+| extend StreamDomain = case(
+    SourceTable in ("claims", "claims_transactions", "patient_expenses", "payer_transitions"), "Financial & Claims",
+    SourceTable in ("observations", "imaging_studies", "devices", "supplies"), "Labs, Vitals & Imaging",
+    SourceTable in ("encounters", "conditions", "allergies", "careplans", "medications", "procedures", "immunizations"), "Clinical Care",
+    "Dimensions (Patients & Hospitals)"
+)
+| summarize Events = count() by bin(event_time, 1m), StreamDomain
+| order by event_time asc
+
+// [Tile 3] Visual: Map — Title: "Hospital Network Geo Map" (Lon=lon, Lat=lat, Size=encounter_count, Label=hospital_name)
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| summarize encounter_count = count(), er_encounters = countif(encounterclass == "emergency"), actual_revenue = round(sum(total_claim_cost), 2), unique_patients = dcount(patient) by organization
+| join kind=inner (organizations | summarize arg_max(event_time, *) by id) on $left.organization == $right.id
+| where isnotnull(lat) and isnotnull(lon)
+| project hospital_name = ["name"], city, hospital_state = ["state"], lon, lat, encounter_count, er_encounters, actual_revenue, unique_patients
+
+// [Tile 4] Visual: Stacked Bar chart — Title: "Top 10 Hospitals by Revenue Breakdown (USD)"
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| summarize
+    TotalRevenue = round(sum(total_claim_cost), 2),
+    PayerCoverage = round(sum(payer_coverage), 2),
+    OutOfPocket = round(sum(out_of_pocket), 2)
+    by organization
+| join kind=inner (organizations | summarize arg_max(event_time, *) by id) on $left.organization == $right.id
+| top 10 by TotalRevenue desc
+| project Hospital = ["name"], PayerCoverage, OutOfPocket
+
+// [Tile 5] Visual: Donut / Pie chart — Title: "Encounters by Visit Class"
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| extend VisitClass = iff(encounterclass in ("ambulatory", "outpatient", "wellness", "urgentcare", "emergency", "inpatient"), encounterclass, "other")
+| summarize Encounters = count() by VisitClass
+| order by Encounters desc
+
+// [Tile 6] Visual: Bar chart — Title: "Billed Revenue by State (USD)"
+clean_encounters()
+| where event_time between (_startTime .. _endTime)
+| summarize RevenueUSD = round(sum(total_claim_cost), 2) by State = sim_state
+| order by RevenueUSD desc
+
+// -----------------------------------------------------------------------------
+// PAGE 2: CLINICAL INSIGHTS  (Recommended page name: "Clinical Insights")
+// Recommended Grid:
+//   Row 1 (Banner): 6 Stat Cards across top (Vital Alerts | Critical | Disorders | Rx Count | Rx Spend | Avg Age)
+//   Row 2 (Hero):   Left = Live Clinical Vital Alerts (Table) | Right = Vitals Trend (Timechart)
+//   Row 3 (Detail): Left = Top 10 Medical Disorders | Middle = Top 10 Medications | Right = Age & Gender
+// -----------------------------------------------------------------------------
+
+// [Tile 7_KPI] Visual: 6 Stat Cards across Row 1
+// Card 1 — Title: "Active Vital Alerts"
+clean_observations() | where event_time between (_startTime .. _endTime) and is_abnormal == true | join kind=leftouter (clean_patients() | project pat_id = id, age_years) on $left.patient == $right.pat_id | where not(age_years < 18 and code in ("8480-6", "8462-4") and numeric_value < 90.0) | summarize ActiveAlerts = dcount(strcat(patient, ":", code))
+
+// Card 2 — Title: "Critical Alerts"
+clean_observations() | where event_time between (_startTime .. _endTime) and alert_level == "Critical" | summarize CriticalAlerts = dcount(strcat(patient, ":", code))
+
+// Card 3 — Title: "Active Medical Disorders"
+clean_conditions() | where event_time between (_startTime .. _endTime) and is_active == true and (description has "(disorder)" or description has_any ("Prediabetes", "Body mass index 30+", "Chronic pain", "Chronic low back pain")) | summarize ActiveDisorders = count()
+
+// Card 4 — Title: "Total Prescriptions"
+clean_medications() | where event_time between (_startTime .. _endTime) | summarize TotalPrescriptions = count()
+
+// Card 5 — Title: "Total Medication Spend" | Unit: USD ($)
+clean_medications() | where event_time between (_startTime .. _endTime) | summarize TotalRxSpendUSD = round(sum(totalcost), 0)
+
+// Card 6 — Title: "Avg Patient Age" | Unit: yrs
+clean_patients() | where event_time between (_startTime .. _endTime) | summarize AvgPatientAge = round(avg(age_years), 1)
+
+// [Tile 7] Visual: Table — Title: "Live Clinical Vital Alerts" (Deduplicated & pediatric-adjusted, no horizontal scroll)
+clean_observations()
+| where event_time between (_startTime .. _endTime)
+| where is_abnormal == true
+| join kind=leftouter (clean_patients() | project id, full_name, age_years) on $left.patient == $right.id
+| where not(age_years < 18 and code in ("8480-6", "8462-4") and numeric_value < 90.0)
+| summarize arg_max(obs_date, *) by patient, code
+| join kind=leftouter (clean_encounters() | project enc_id = id, organization) on $left.encounter == $right.enc_id
+| join kind=leftouter (organizations | summarize arg_max(event_time, *) by id | project org_id = id, hospital_name = ["name"]) on $left.organization == $right.org_id
+| extend SeverityOrder = iff(alert_level == "Critical", 0, 1)
+| project
+    Alert = alert_level,
+    Patient = coalesce(full_name, patient),
+    Age = age_years,
+    Vital = description,
+    Value = numeric_value,
+    Units = units,
+    Hospital = hospital_name,
+    SeverityOrder,
+    obs_date
+| order by SeverityOrder asc, obs_date desc
+| project-away SeverityOrder, obs_date
+| take 30
+
+// [Tile 8] Visual: Timechart — Title: "Heart Rate & Blood Pressure Trend"
+clean_observations()
+| where event_time between (_startTime .. _endTime)
+| where code in ("8867-4", "8480-6", "8462-4") and isnotnull(numeric_value)
+| extend Metric = case(code == "8867-4", "Heart Rate (bpm)", code == "8480-6", "Systolic BP (mmHg)", "Diastolic BP (mmHg)")
+| summarize AvgValue = round(avg(numeric_value), 1) by bin(event_time, 1m), Metric
+| order by event_time asc
+
+// [Tile 9] Visual: Bar chart — Title: "Top 10 Active Medical Disorders" (Excludes employment/admin notes)
+clean_conditions()
+| where event_time between (_startTime .. _endTime)
+| where is_active == true
+| where description has "(disorder)" or description has_any ("Prediabetes", "Body mass index 30+", "Chronic pain", "Chronic low back pain")
+| extend Disorder = trim(" ", replace_regex(description, @"\s*\((disorder|finding)\)$", ""))
+| summarize ActiveCases = count() by Disorder
+| top 10 by ActiveCases desc
+
+// [Tile 10] Visual: Bar chart — Title: "Top 10 Medications by Total Spend (USD)" (Single USD scale)
+clean_medications()
+| where event_time between (_startTime .. _endTime)
+| extend Medication = tostring(split(description, " [")[0])
+| summarize TotalSpendUSD = round(sum(totalcost), 2) by Medication
+| top 10 by TotalSpendUSD desc
+
+// [Tile 11] Visual: Column chart — Title: "Patients by Age Group & Gender"
+clean_patients()
+| where event_time between (_startTime .. _endTime)
+| summarize Patients = count() by age_group, gender
+| order by age_group asc
+
+// -----------------------------------------------------------------------------
+// PAGE 3: FINANCE & DATA QUALITY  (Recommended page name: "Finance & Data Quality")
+// Recommended Grid:
+//   Row 1 (Banner): 6 Stat Cards across top
+//   Row 2 (Hero):   Left = Claims Cashflow (Bar) | Right = Insurance Payer Coverage (Bar)
+//   Row 3 (Detail): Left = Data Quality Scorecard (Table) | Right = Dead Letter Queue (Table)
+// -----------------------------------------------------------------------------
+
+// [Tile 12_KPI] Visual: 6 Stat Cards across Row 1
+// Card 1 — Title: "Total Billed Charges" | Unit: USD ($)
+clean_claims_transactions() | where event_time between (_startTime .. _endTime) | summarize TotalChargesUSD = round(sum(charge_amount), 0)
+
+// Card 2 — Title: "Total Payments Collected" | Unit: USD ($)
+clean_claims_transactions() | where event_time between (_startTime .. _endTime) | summarize TotalPaymentsUSD = round(sum(payment_amount), 0)
+
+// Card 3 — Title: "Insurance Transfers" | Unit: USD ($)
+clean_claims_transactions() | where event_time between (_startTime .. _endTime) | summarize TotalTransfersUSD = round(sum(transfer_amount), 0)
+
+// Card 4 — Title: "Outstanding Balance" | Unit: USD ($)
+clean_claims_transactions() | where event_time between (_startTime .. _endTime) | summarize TotalOutstandingUSD = round(sum(coalesce(outstanding, 0.0)), 0)
+
+// Card 5 — Title: "Stream Health Score" | Unit: %
+synthea_raw | where ingestion_time() between (_startTime .. _endTime) | summarize HealthPct = round(100.0 * countif(isnotnull(payload)) / max_of(count(), 1), 2)
+
+// Card 6 — Title: "DLQ Failed Events"
+synthea_dlq | where event_time between (_startTime .. _endTime) | summarize DLQ_Errors = count()
+
+// [Tile 12] Visual: Bar chart — Title: "Claims Cashflow by Type & Payment Method (USD)"
+clean_claims_transactions()
+| where event_time between (_startTime .. _endTime)
+| summarize TotalAmountUSD = round(sum(coalesce(amount, payments, transfers, 0.0)), 2) by Transaction = strcat(tx_type, " (", payment_method, ")")
+| order by TotalAmountUSD desc
+
+// [Tile 13] Visual: Bar chart (Stacked) — Title: "Insurance Payers: Covered vs Uncovered (USD)"
+payers
+| where event_time between (_startTime .. _endTime)
+| summarize arg_max(event_time, *) by id
+| project Payer = ["name"], CoveredUSD = round(amount_covered, 2), UncoveredUSD = round(amount_uncovered, 2)
+| order by CoveredUSD desc
+
+// [Tile 14] Visual: Table — Title: "Live Pipeline Data Quality Scorecard"
+dq_pipeline_health()
+
+// [Tile 15] Visual: Table — Title: "Dead Letter Queue (Malformed Events)"
+synthea_dlq
+| where event_time between (_startTime .. _endTime)
+| project event_time, source_table, error_reason, raw_payload
+| order by event_time desc
+| take 20

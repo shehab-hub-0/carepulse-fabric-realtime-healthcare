@@ -191,5 +191,3 @@ Run the unit and KQL script validation suite from the repository root:
 ```powershell
 python -m pytest -v
 ```
-#   c a r e p u l s e - f a b r i c - r e a l t i m e - h e a l t h c a r e  
- 
